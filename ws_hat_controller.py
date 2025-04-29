@@ -69,13 +69,18 @@ class TemperatureGetter:
         latest_result = cls._singleton.get_readout()
         # temper2 also has internal temperature
         # latest_resultresult["internal temperature"],
-        return Measurement(
-            time=datetime.now(timezone.utc),
-            raw_celsius=latest_result["external temperature"],
-            calibrated_celsius=round(
-                cls._singleton.apply_calibration(latest_result["external temperature"]),
+        raw_celsius = latest_result.get("external temperature")
+        if raw_celsius is None:
+            calibrated_celsius = None
+        else:
+            calibrated_celsius = round(
+                cls._singleton.apply_calibration(raw_celsius),
                 1
             )
+        return Measurement(
+            time=datetime.now(timezone.utc),
+            raw_celsius=raw_celsius,
+            calibrated_celsius=calibrated_celsius,
         )
 
     def __init__(self):
@@ -198,6 +203,8 @@ class Canvas:
 
         for idx, measurement in enumerate(self.temperature_records):
             temp = measurement.calibrated_celsius
+            if temp is None:
+                continue
             norm = (temp - min_temp) / (max_temp - min_temp)
             norm = max(0.0, min(1.0, norm))  # clamp
 
@@ -395,18 +402,23 @@ try:
         if tN - LAST_POLL_TIME > TEMPERATURE_POLL_FREQUENCY_SECONDS:
             LAST_POLL_TIME = tN
 
+            current_heating_mode = HeatingController.get_instance().get_current_heating_mode()
             latest_measurement = TemperatureGetter.get_current_measurement()
+            power_status = HeatingController.get_instance().get_power_status()
+
+            if latest_measurement.raw_celsius is None:
+                print(f"{datetime.now()} WARNING: no measurement")
+                time.sleep(5)
+                continue
             canvas.temperature_records.append(latest_measurement)
 
-            current_heating_mode = HeatingController.get_instance().get_current_heating_mode()
-            print("current heating mode", current_heating_mode)
+            print(f"{datetime.now()} [{current_heating_mode}]\t", end="")
             if current_heating_mode.NAME == "natto":
                 topic_postfix = "inside natto bowl"
             elif current_heating_mode.NAME == "yogurt":
                 topic_postfix = "inside yogurt bowl"
             else:
                 topic_postfix = current_heating_mode.NAME
-            power_status = HeatingController.get_instance().get_power_status()
             topic = f"environment/sensors/devices/{topic_postfix}"
             payload = {
                 "temper_temperature": f"{latest_measurement.raw_celsius}C",
@@ -427,17 +439,6 @@ try:
             else:
                 print(f"do nothing ({current_heating_mode.lower_limit} < {latest_measurement.calibrated_celsius} < {current_heating_mode.upper_limit})")
 
-        # Draw blocks with optional font or fallback
-        canvas.draw_text_block(
-            text=f"{latest_measurement.calibrated_celsius:.2f} C",
-            pos=(0, 65),
-            size=(140, 35),
-            font_name=font0[0],
-            font_size=font0[1],
-            text_color="BLACK",
-            bg_color="WHITE"
-        )
-
         canvas.draw_text_block(
             text=f"{current_heating_mode}",
             pos=(0, 115),
@@ -447,25 +448,45 @@ try:
             text_color="RED",
         )
 
-        # Draw temperature sparkline
-        canvas.draw_temperature_sparkline(
-            pos=(0, disp.height - 60 - 5),  
-            size=(disp.width, 60),  # size of the region
-            point_style="square",
-            point_color="BLACK"
-        )
+        if latest_measurement.raw_celsius is not None:
+            # Draw blocks with optional font or fallback
+            canvas.draw_text_block(
+                text=f"{latest_measurement.calibrated_celsius:.2f} C",
+                pos=(0, 65),
+                size=(140, 35),
+                font_name=font0[0],
+                font_size=font0[1],
+                text_color="BLACK",
+                bg_color="WHITE"
+            )
+
+            # Draw temperature sparkline
+            canvas.draw_temperature_sparkline(
+                pos=(0, disp.height - 60 - 5),  
+                size=(disp.width, 60),  # size of the region
+                point_style="square",
+                point_color="BLACK"
+            )
 
         # 4. Render to screen
         canvas.render(disp, 0)
 
-        disp.bl_DutyCycle(GlobalConfig.LCD_BRIGHTNESS)
+        # this seems to freeze the device at some point!
+        # disp.bl_DutyCycle(GlobalConfig.LCD_BRIGHTNESS)
         time.sleep(0.5)  # Small sleep for CPU relief (adjust frame rate)
 
 except KeyboardInterrupt as e:
     print("Exiting cleanly.", e)
 
 except Exception as e:
-    print("unhandled exception", e)
+    import traceback
+    exc_type, exc_value, exc_traceback = sys.exc_info()
+    line_number = traceback.extract_tb(exc_traceback)[-1][1]
+    filename = exc_traceback.tb_frame.f_code.co_filename
+    lineno = exc_traceback.tb_lineno
+    function_name = exc_traceback.tb_frame.f_code.co_name
+    print(f"UNHANDLED EXCEPTION: {filename}:{lineno}, in {function_name}\n{e}")
+    traceback.print_exception(exc_type, exc_value, exc_traceback)
 
 GPIO.cleanup()
 disp.module_exit()
