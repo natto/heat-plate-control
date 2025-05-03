@@ -551,13 +551,13 @@ try:
                 if maybe_handler is not None:
                     maybe_handler(name, cfg)
 
+        current_heating_mode = (
+            HeatingController.get_instance().get_current_heating_mode()
+        )
         tN = time.time()
         if tN - LAST_POLL_TIME > TEMPERATURE_POLL_FREQUENCY_SECONDS:
             LAST_POLL_TIME = tN
 
-            current_heating_mode = (
-                HeatingController.get_instance().get_current_heating_mode()
-            )
             latest_measurement = TemperatureGetter.get_current_measurement()
             power_status = HeatingController.get_instance().get_power_status()
 
