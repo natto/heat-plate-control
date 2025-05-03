@@ -1,24 +1,30 @@
 # -*- coding:utf-8 -*-
-import sys
-import spidev as SPI
-import RPi.GPIO as GPIO
+import json
 import logging
-from waveshare import ST7789
 import os.path as _p
-from typing import Tuple, Deque, List, Dict, Literal
+import sys
+import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
-import time
-import subprocess
+from datetime import datetime, timedelta, timezone
 from pprint import pprint
-import json
-import yaml
-
-from PIL import Image,ImageDraw,ImageFont
+from typing import Deque, Dict, List, Literal, Tuple
 
 import paho.mqtt.publish as publish
+import RPi.GPIO as GPIO
+import spidev as SPI
+import yaml
+from PIL import Image, ImageDraw, ImageFont
 
+from waveshare import ST7789
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s.%(msecs)03d %(levelname)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 HEAT_PLATE_RELAY_GPIO = 12
 GPIO.setmode(GPIO.BCM)
@@ -29,27 +35,24 @@ with open("settings.yaml") as ifile:
     SETTINGS = yaml.safe_load(ifile)
 pprint(SETTINGS)
 
-MQTT_HOST = SETTINGS['mqtt']['host']
-MQTT_PORT = SETTINGS['mqtt']['port']
-SHOULD_PUSH_TO_MOSQUITTO = SETTINGS['mqtt']['should_push']
+MQTT_HOST = SETTINGS["mqtt"]["host"]
+MQTT_PORT = SETTINGS["mqtt"]["port"]
+SHOULD_PUSH_TO_MOSQUITTO = SETTINGS["mqtt"]["should_push"]
+
 
 def mqtt_publish(broker_host: str, broker_port: int, topic: str, payload: str):
     """Publish an MQTT message using paho-mqtt in one shot."""
     try:
-        publish.single(
-            topic,
-            payload=payload,
-            hostname=broker_host,
-            port=broker_port
-        )
+        publish.single(topic, payload=payload, hostname=broker_host, port=broker_port)
     except Exception as e:
-        print("WARNING: FAILED TO PUSH MQTT MESSAGE", e)
-        pprint(payload)
+        logger.warning("Failed to push MQTT message: %s", e)
+        logger.debug("Failed payload: %s", payload)
 
 
 class GlobalConfig:
     LCD_BRIGHTNESS_LEVELS = (0, 10, 70)
     LCD_BRIGHTNESS = LCD_BRIGHTNESS_LEVELS[1]
+
 
 @dataclass
 class Measurement:
@@ -59,7 +62,6 @@ class Measurement:
 
 
 class TemperatureGetter:
-
     _singleton = None
 
     @classmethod
@@ -73,10 +75,7 @@ class TemperatureGetter:
         if raw_celsius is None:
             calibrated_celsius = None
         else:
-            calibrated_celsius = round(
-                cls._singleton.apply_calibration(raw_celsius),
-                1
-            )
+            calibrated_celsius = round(cls._singleton.apply_calibration(raw_celsius), 1)
         return Measurement(
             time=datetime.now(timezone.utc),
             raw_celsius=raw_celsius,
@@ -85,8 +84,9 @@ class TemperatureGetter:
 
     def __init__(self):
         from temper.temper import Temper
+
         self._temper = Temper()
-        self.calibrate_sensor(SETTINGS['calibration_points'])
+        self.calibrate_sensor(SETTINGS["calibration_points"])
 
     def get_readout(self):
         results = self._temper.read()
@@ -105,24 +105,34 @@ class TemperatureGetter:
     def calibrate_sensor(self, calibration_points: List[Tuple[float, float]]):
         """Given (sensor_readout, actual_temperature) pairs, compute calibration."""
         import numpy as np
+
         sensor_readouts, actual_temperatures = zip(*calibration_points)
         slope, intercept = np.polyfit(sensor_readouts, actual_temperatures, 1)
         self._calibration = (slope, intercept)
 
 
 class Canvas:
-    def __init__(self, width, height, bg_color="WHITE", default_font_path="/usr/share/fonts/truetype/freefont/FreeMono.ttf", default_font_size=12):
+    def __init__(
+        self,
+        width,
+        height,
+        bg_color="WHITE",
+        default_font_path="/usr/share/fonts/truetype/freefont/FreeMono.ttf",
+        default_font_size=12,
+    ):
         self.image = Image.new("RGB", (width, height), bg_color)
         self.draw = ImageDraw.Draw(self.image)
         self.fonts = {}
-        
+
         self.temperature_records: Deque[Measurement] = deque(maxlen=100)
 
         # Attempt to load the default font immediately
         try:
             self.default_font_key = self.load_font(default_font_path, default_font_size)
         except Exception as e:
-            raise RuntimeError(f"Failed to load default font {default_font_name} size {default_font_size}: {e}")
+            raise RuntimeError(
+                f"Failed to load default font {default_font_name} size {default_font_size}: {e}"
+            )
 
     def load_font(self, font_path: str, font_size: float) -> Tuple[str, float]:
         """Load a font once and store it under a name."""
@@ -133,15 +143,26 @@ class Canvas:
         self.fonts[font_key] = ImageFont.truetype(font_path, font_size)
         return font_key
 
-    def draw_text_block(self, text, pos, size, font_name=None, font_size=None, text_color="BLACK", bg_color=None):
+    def draw_text_block(
+        self,
+        text,
+        pos,
+        size,
+        font_name=None,
+        font_size=None,
+        text_color="BLACK",
+        bg_color=None,
+    ):
         """Draw text with optional background, using preloaded font or default."""
         if font_name is None or font_size is None:
             font_key = self.default_font_key
         else:
             font_key = (font_name, font_size)
-        
+
         if font_key not in self.fonts:
-            logging.warning(f"Font {font_key} not loaded, falling back to default font {self.default_font_key}")
+            logging.warning(
+                f"Font {font_key} not loaded, falling back to default font {self.default_font_key}"
+            )
             font_key = self.default_font_key
 
         x0, y0 = pos
@@ -155,7 +176,7 @@ class Canvas:
 
     def clear(self, bg_color="WHITE"):
         """Clear the entire canvas."""
-        self.draw.rectangle([(0,0), self.image.size], fill=bg_color)
+        self.draw.rectangle([(0, 0), self.image.size], fill=bg_color)
 
     def render(self, disp, rotate_angle=0, brightness=None):
         """Send the current canvas to the display."""
@@ -166,18 +187,41 @@ class Canvas:
             disp.bl_DutyCycle(GlobalConfig.LCD_BRIGHTNESS)
         disp.ShowImage(rotated_image)
 
-    def draw_button(self, shape_type, shape_data, pressed, color_pressed=0, color_released=0xff00):
+    def draw_button(
+        self, shape_type, shape_data, pressed, color_pressed=0, color_released=0xFF00
+    ):
         """Draw a button in pressed/released state."""
         if shape_type == "polygon":
-            self.draw.polygon(shape_data, outline=255, fill=color_pressed if pressed else color_released)
+            self.draw.polygon(
+                shape_data,
+                outline=255,
+                fill=color_pressed if pressed else color_released,
+            )
         elif shape_type == "rectangle":
-            self.draw.rectangle(shape_data, outline=255, fill=color_pressed if pressed else color_released)
+            self.draw.rectangle(
+                shape_data,
+                outline=255,
+                fill=color_pressed if pressed else color_released,
+            )
         elif shape_type == "ellipse":
-            self.draw.ellipse(shape_data, outline=255, fill=color_pressed if pressed else color_released)
+            self.draw.ellipse(
+                shape_data,
+                outline=255,
+                fill=color_pressed if pressed else color_released,
+            )
         else:
             raise ValueError(f"Unsupported shape {shape_type}")
 
-    def draw_temperature_sparkline(self, pos, size, min_temp=20.0, max_temp=60.0, point_style="square", point_color="BLACK", grid_color=(200, 200, 200)):
+    def draw_temperature_sparkline(
+        self,
+        pos,
+        size,
+        min_temp=20.0,
+        max_temp=60.0,
+        point_style="square",
+        point_color="BLACK",
+        grid_color=(200, 200, 200),
+    ):
         """Draw a simple sparkline from temperature_records at the given position, with optional grid lines."""
         x0, y0 = pos
         w, h = size
@@ -212,20 +256,21 @@ class Canvas:
             x = int(x0 + idx * x_step)
 
             if point_style == "square":
-                self.draw.rectangle([x-1, y-1, x+1, y+1], fill=point_color)
+                self.draw.rectangle([x - 1, y - 1, x + 1, y + 1], fill=point_color)
             elif point_style == "circle":
-                self.draw.ellipse([x-1, y-1, x+1, y+1], fill=point_color)
+                self.draw.ellipse([x - 1, y - 1, x + 1, y + 1], fill=point_color)
             else:
                 raise ValueError(f"Unknown point style: {point_style}")
 
 
 class HeatingMode:
-
     NAME: str
     upper_limit: float
     lower_limit: float
 
-    def __init__(self, name: str, lower: float, upper: float, display_name: str | None = None):
+    def __init__(
+        self, name: str, lower: float, upper: float, display_name: str | None = None
+    ):
         self.NAME = name
         self.lower_limit = lower
         self.upper_limit = upper
@@ -293,15 +338,29 @@ disp.clear()
 
 
 def handle_key_1(button_name, button_config):
-    current_brightness_index = GlobalConfig.LCD_BRIGHTNESS_LEVELS.index(GlobalConfig.LCD_BRIGHTNESS)
-    next_index = (current_brightness_index + 1) % len(GlobalConfig.LCD_BRIGHTNESS_LEVELS)
+    current_brightness_index = GlobalConfig.LCD_BRIGHTNESS_LEVELS.index(
+        GlobalConfig.LCD_BRIGHTNESS
+    )
+    next_index = (current_brightness_index + 1) % len(
+        GlobalConfig.LCD_BRIGHTNESS_LEVELS
+    )
     GlobalConfig.LCD_BRIGHTNESS = GlobalConfig.LCD_BRIGHTNESS_LEVELS[next_index]
 
+
 def handle_key_2(button_name, button_config):
-    current_mode_index = HeatingController.AVAILABLE_MODES.index(HeatingController.get_instance().get_current_heating_mode())
+    current_mode_index = HeatingController.AVAILABLE_MODES.index(
+        HeatingController.get_instance().get_current_heating_mode()
+    )
     next_index = (current_mode_index + 1) % len(HeatingController.AVAILABLE_MODES)
-    HeatingController.get_instance().change_to_mode(HeatingController.AVAILABLE_MODES[next_index].NAME)
-    print("key 2", button_name, HeatingController.get_instance().get_current_heating_mode())
+    HeatingController.get_instance().change_to_mode(
+        HeatingController.AVAILABLE_MODES[next_index].NAME
+    )
+    logger.info(
+        "key 2 %s, new mode: %s",
+        button_name,
+        HeatingController.get_instance().get_current_heating_mode(),
+    )
+
 
 def handle_key_3(button_name, button_config):
     current_power_status = HeatingController.get_instance().get_power_status()
@@ -309,7 +368,7 @@ def handle_key_3(button_name, button_config):
         HeatingController.get_instance().turn_on()
     else:
         HeatingController.get_instance().turn_off()
-    print("relay", HeatingController.get_instance().get_power_status())
+    logger.info("relay status: %s", HeatingController.get_instance().get_power_status())
 
 
 BUTTON_CONFIG = {
@@ -358,13 +417,15 @@ BUTTON_CONFIG = {
     },
 }
 
+
 def poll_buttons(disp):
     states = {}
     for name, cfg in BUTTON_CONFIG.items():
-        pressed = disp.digital_read(cfg["pin"]) != 0  # 0=released, 1=pressed in Waveshare logic
+        pressed = (
+            disp.digital_read(cfg["pin"]) != 0
+        )  # 0=released, 1=pressed in Waveshare logic
         states[name] = pressed
     return states
-
 
 
 canvas = Canvas(disp.width, disp.height)
@@ -391,7 +452,7 @@ try:
                 canvas.draw_button("polygon", cfg["points"], pressed)
             else:
                 canvas.draw_button(cfg["shape"], cfg["bbox"], pressed)
-            
+
             if pressed:
                 maybe_handler = cfg.get("handler")
                 print(name, maybe_handler)
@@ -402,17 +463,26 @@ try:
         if tN - LAST_POLL_TIME > TEMPERATURE_POLL_FREQUENCY_SECONDS:
             LAST_POLL_TIME = tN
 
-            current_heating_mode = HeatingController.get_instance().get_current_heating_mode()
+            current_heating_mode = (
+                HeatingController.get_instance().get_current_heating_mode()
+            )
             latest_measurement = TemperatureGetter.get_current_measurement()
             power_status = HeatingController.get_instance().get_power_status()
 
             if latest_measurement.raw_celsius is None:
-                print(f"{datetime.now()} WARNING: no measurement")
+                logger.warning("No temperature measurement available")
                 time.sleep(5)
                 continue
             canvas.temperature_records.append(latest_measurement)
 
-            print(f"{datetime.now()} [{current_heating_mode}]\t", end="")
+            logger.info(
+                "[%s] Temperature: %.2f°C (raw: %.2f°C), Power: %s",
+                current_heating_mode,
+                latest_measurement.calibrated_celsius,
+                latest_measurement.raw_celsius,
+                power_status,
+            )
+
             if current_heating_mode.NAME == "natto":
                 topic_postfix = "inside natto bowl"
             elif current_heating_mode.NAME == "yogurt":
@@ -428,16 +498,37 @@ try:
             if SHOULD_PUSH_TO_MOSQUITTO and current_heating_mode.NAME != "free":
                 mqtt_publish(MQTT_HOST, MQTT_PORT, topic, json.dumps(payload))
             else:
-                pprint(payload)
-            
-            if power_status == "off" and latest_measurement.calibrated_celsius < current_heating_mode.lower_limit:
-                print(f"temperature too low ({latest_measurement.calibrated_celsius} < {current_heating_mode.lower_limit}); turn on")
+                logger.debug("MQTT payload: %s", payload)
+
+            if (
+                power_status == "off"
+                and latest_measurement.calibrated_celsius
+                < current_heating_mode.lower_limit
+            ):
+                logger.info(
+                    "Temperature too low (%.2f < %.2f); turning on",
+                    latest_measurement.calibrated_celsius,
+                    current_heating_mode.lower_limit,
+                )
                 HeatingController.get_instance().turn_on()
-            elif power_status == "on" and latest_measurement.calibrated_celsius > current_heating_mode.upper_limit:
-                print(f"temperature too high ({latest_measurement.calibrated_celsius} > {current_heating_mode.upper_limit}); turn off")
+            elif (
+                power_status == "on"
+                and latest_measurement.calibrated_celsius
+                > current_heating_mode.upper_limit
+            ):
+                logger.info(
+                    "Temperature too high (%.2f > %.2f); turning off",
+                    latest_measurement.calibrated_celsius,
+                    current_heating_mode.upper_limit,
+                )
                 HeatingController.get_instance().turn_off()
             else:
-                print(f"do nothing ({current_heating_mode.lower_limit} < {latest_measurement.calibrated_celsius} < {current_heating_mode.upper_limit})")
+                logger.debug(
+                    "Temperature within bounds (%.2f < %.2f < %.2f)",
+                    current_heating_mode.lower_limit,
+                    latest_measurement.calibrated_celsius,
+                    current_heating_mode.upper_limit,
+                )
 
         canvas.draw_text_block(
             text=f"{current_heating_mode}",
@@ -457,15 +548,15 @@ try:
                 font_name=font0[0],
                 font_size=font0[1],
                 text_color="BLACK",
-                bg_color="WHITE"
+                bg_color="WHITE",
             )
 
             # Draw temperature sparkline
             canvas.draw_temperature_sparkline(
-                pos=(0, disp.height - 60 - 5),  
+                pos=(0, disp.height - 60 - 5),
                 size=(disp.width, 60),  # size of the region
                 point_style="square",
-                point_color="BLACK"
+                point_color="BLACK",
             )
 
         # 4. Render to screen
@@ -476,18 +567,23 @@ try:
         time.sleep(0.5)  # Small sleep for CPU relief (adjust frame rate)
 
 except KeyboardInterrupt as e:
-    print("Exiting cleanly.", e)
+    logger.info("Exiting cleanly: %s", e)
 
 except Exception as e:
     import traceback
+
     exc_type, exc_value, exc_traceback = sys.exc_info()
-    line_number = traceback.extract_tb(exc_traceback)[-1][1]
-    filename = exc_traceback.tb_frame.f_code.co_filename
-    lineno = exc_traceback.tb_lineno
-    function_name = exc_traceback.tb_frame.f_code.co_name
-    print(f"UNHANDLED EXCEPTION: {filename}:{lineno}, in {function_name}\n{e}")
-    traceback.print_exception(exc_type, exc_value, exc_traceback)
+    if exc_traceback is not None:
+        line_number = traceback.extract_tb(exc_traceback)[-1][1]
+        filename = exc_traceback.tb_frame.f_code.co_filename
+        lineno = exc_traceback.tb_lineno
+        function_name = exc_traceback.tb_frame.f_code.co_name
+        logger.error(
+            "UNHANDLED EXCEPTION: %s:%d, in %s\n%s", filename, lineno, function_name, e
+        )
+        traceback.print_exception(exc_type, exc_value, exc_traceback)
+    else:
+        logger.error("UNHANDLED EXCEPTION: %s", e)
 
 GPIO.cleanup()
 disp.module_exit()
-
