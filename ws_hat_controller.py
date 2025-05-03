@@ -5,10 +5,11 @@ import os.path as _p
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pprint import pprint
-from typing import Deque, Dict, List, Literal, Tuple
+from typing import Deque, Dict, List, Literal, Optional, Tuple
+from pprint import pprint
 
 import paho.mqtt.publish as publish
 import RPi.GPIO as GPIO
@@ -26,18 +27,76 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-HEAT_PLATE_RELAY_GPIO = 12
+
+@dataclass
+class MQTTConfig:
+    should_push: bool
+    host: str
+    port: int
+
+
+@dataclass
+class CalibrationPoint:
+    sensor: float
+    actual: float
+
+
+@dataclass
+class GlobalConfig:
+    # Display settings
+    lcd_brightness_levels: Tuple[int, ...] = field(default_factory=lambda: (0, 10, 70))
+    lcd_brightness: int = 10
+
+    # MQTT settings
+    mqtt: MQTTConfig = field(
+        default_factory=lambda: MQTTConfig(False, "localhost", 1883)
+    )
+
+    # Calibration settings
+    calibration_points: List[CalibrationPoint] = field(default_factory=list)
+
+    # GPIO settings
+    heat_plate_relay_gpio: int = 12
+
+    @classmethod
+    def from_yaml(cls, yaml_path: str) -> "GlobalConfig":
+        with open(yaml_path) as ifile:
+            raw_settings = yaml.safe_load(ifile)
+
+        # Convert calibration points to proper objects
+        calibration_points = [
+            CalibrationPoint(sensor=point[0], actual=point[1])
+            for point in raw_settings.get("calibration_points", [])
+        ]
+
+        # Create MQTT config
+        mqtt_settings = raw_settings.get("mqtt", {})
+        mqtt_config = MQTTConfig(
+            should_push=mqtt_settings.get("should_push", False),
+            host=mqtt_settings.get("host", "localhost"),
+            port=mqtt_settings.get("port", 1883),
+        )
+
+        return cls(calibration_points=calibration_points, mqtt=mqtt_config)
+
+
+# Load global configuration
+_example_config = """
+# sensor, actual
+calibration_points:
+  - [3.06, 3.1]
+  - [77.93, 80.9]
+mqtt:
+  should_push: false
+  host: 192.168.1.131
+  port: 1883
+"""
+CONFIG = GlobalConfig.from_yaml("settings.yaml")
+pprint(CONFIG)
+
+# Initialize GPIO
 GPIO.setmode(GPIO.BCM)
-GPIO.setup(HEAT_PLATE_RELAY_GPIO, GPIO.OUT)
-
-
-with open("settings.yaml") as ifile:
-    SETTINGS = yaml.safe_load(ifile)
-pprint(SETTINGS)
-
-MQTT_HOST = SETTINGS["mqtt"]["host"]
-MQTT_PORT = SETTINGS["mqtt"]["port"]
-SHOULD_PUSH_TO_MOSQUITTO = SETTINGS["mqtt"]["should_push"]
+GPIO.setup(CONFIG.heat_plate_relay_gpio, GPIO.OUT)
 
 
 def mqtt_publish(broker_host: str, broker_port: int, topic: str, payload: str):
@@ -49,7 +108,8 @@ def mqtt_publish(broker_host: str, broker_port: int, topic: str, payload: str):
         logger.debug("Failed payload: %s", payload)
 
 
-class GlobalConfig:
+@dataclass
+class DisplayConfig:
     LCD_BRIGHTNESS_LEVELS = (0, 10, 70)
     LCD_BRIGHTNESS = LCD_BRIGHTNESS_LEVELS[1]
 
@@ -86,7 +146,7 @@ class TemperatureGetter:
         from temper.temper import Temper
 
         self._temper = Temper()
-        self.calibrate_sensor(SETTINGS["calibration_points"])
+        self.calibrate_sensor(CONFIG.calibration_points)
 
     def get_readout(self):
         results = self._temper.read()
@@ -105,8 +165,8 @@ class TemperatureGetter:
     def calibrate_sensor(self, calibration_points: List[Tuple[float, float]]):
         """Given (sensor_readout, actual_temperature) pairs, compute calibration."""
         import numpy as np
-
-        sensor_readouts, actual_temperatures = zip(*calibration_points)
+        sensor_readouts = [point.sensor for point in calibration_points]
+        actual_temperatures = [point.actual for point in calibration_points]
         slope, intercept = np.polyfit(sensor_readouts, actual_temperatures, 1)
         self._calibration = (slope, intercept)
 
@@ -321,21 +381,21 @@ class HeatingController:
     # so to turn off, we shut the GPIO
     def turn_off(self):
         self._power_status = "off"
-        GPIO.setup(HEAT_PLATE_RELAY_GPIO, GPIO.IN)
+        GPIO.setup(CONFIG.heat_plate_relay_gpio, GPIO.IN)
 
     def turn_on(self):
         self._power_status = "on"
-        GPIO.setup(HEAT_PLATE_RELAY_GPIO, GPIO.OUT)
+        GPIO.setup(CONFIG.heat_plate_relay_gpio, GPIO.OUT)
 
 
 def handle_key_1(button_name, button_config):
-    current_brightness_index = GlobalConfig.LCD_BRIGHTNESS_LEVELS.index(
-        GlobalConfig.LCD_BRIGHTNESS
+    current_brightness_index = DisplayConfig.LCD_BRIGHTNESS_LEVELS.index(
+        DisplayConfig.LCD_BRIGHTNESS
     )
     next_index = (current_brightness_index + 1) % len(
-        GlobalConfig.LCD_BRIGHTNESS_LEVELS
+        DisplayConfig.LCD_BRIGHTNESS_LEVELS
     )
-    GlobalConfig.LCD_BRIGHTNESS = GlobalConfig.LCD_BRIGHTNESS_LEVELS[next_index]
+    DisplayConfig.LCD_BRIGHTNESS = DisplayConfig.LCD_BRIGHTNESS_LEVELS[next_index]
 
 
 def handle_key_2(button_name, button_config):
@@ -368,7 +428,7 @@ disp.Init()
 
 # Clear display.
 disp.clear()
-disp.bl_DutyCycle(GlobalConfig.LCD_BRIGHTNESS)
+disp.bl_DutyCycle(DisplayConfig.LCD_BRIGHTNESS)
 
 
 BUTTON_CONFIG = {
@@ -495,8 +555,10 @@ try:
                 "corrected_temperature": f"{latest_measurement.calibrated_celsius}C",
                 "heat_plate_power": power_status,
             }
-            if SHOULD_PUSH_TO_MOSQUITTO and current_heating_mode.NAME != "free":
-                mqtt_publish(MQTT_HOST, MQTT_PORT, topic, json.dumps(payload))
+            if CONFIG.mqtt.should_push and current_heating_mode.NAME != "free":
+                mqtt_publish(
+                    CONFIG.mqtt.host, CONFIG.mqtt.port, topic, json.dumps(payload)
+                )
             else:
                 logger.debug("MQTT payload: %s", payload)
 
@@ -563,7 +625,7 @@ try:
         canvas.render_to_display(disp)
 
         # this seems to freeze the device at some point!
-        # disp.bl_DutyCycle(GlobalConfig.LCD_BRIGHTNESS)
+        # disp.bl_DutyCycle(DisplayConfig.LCD_BRIGHTNESS)
         time.sleep(0.5)  # Small sleep for CPU relief (adjust frame rate)
 
 except KeyboardInterrupt as e:
