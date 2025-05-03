@@ -9,7 +9,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pprint import pprint
 from typing import Deque, Dict, List, Literal, Optional, Tuple
-from pprint import pprint
 
 import paho.mqtt.publish as publish
 import RPi.GPIO as GPIO
@@ -112,6 +111,18 @@ def mqtt_publish(broker_host: str, broker_port: int, topic: str, payload: str):
 class DisplayConfig:
     LCD_BRIGHTNESS_LEVELS = (0, 10, 70)
     LCD_BRIGHTNESS = LCD_BRIGHTNESS_LEVELS[1]
+    _previous_brightness = LCD_BRIGHTNESS_LEVELS[1]  # Track previous brightness
+
+    @classmethod
+    def update_brightness(cls, new_brightness: int):
+        """Update brightness and track the change."""
+        cls._previous_brightness = cls.LCD_BRIGHTNESS
+        cls.LCD_BRIGHTNESS = new_brightness
+
+    @classmethod
+    def brightness_changed(cls) -> bool:
+        """Check if brightness has changed since last update."""
+        return cls.LCD_BRIGHTNESS != cls._previous_brightness
 
 
 @dataclass
@@ -162,13 +173,22 @@ class TemperatureGetter:
         slope, intercept = self._calibration
         return raw_temp * slope + intercept
 
-    def calibrate_sensor(self, calibration_points: List[Tuple[float, float]]):
+    def calibrate_sensor(self, calibration_points: List[CalibrationPoint]):
         """Given (sensor_readout, actual_temperature) pairs, compute calibration."""
         import numpy as np
+
+        if not calibration_points:
+            logger.warning("No calibration points provided, using raw temperature")
+            self._calibration = None
+            return
+
         sensor_readouts = [point.sensor for point in calibration_points]
         actual_temperatures = [point.actual for point in calibration_points]
         slope, intercept = np.polyfit(sensor_readouts, actual_temperatures, 1)
         self._calibration = (slope, intercept)
+        logger.info(
+            "Calibration computed: slope=%.3f, intercept=%.3f", slope, intercept
+        )
 
 
 class Canvas:
@@ -243,7 +263,7 @@ class Canvas:
         rotated_image = self.image.rotate(rotate_angle)
         if brightness is not None:
             disp.bl_DutyCycle(brightness)
-        logger.info(f"rendering image; pin value: {disp.GPIO_BL_PIN.value}")
+        # logger.info(f"rendering image; pin value: {disp.GPIO_BL_PIN.value}")
         disp.ShowImage(rotated_image)
 
     def draw_button(
@@ -395,7 +415,8 @@ def handle_key_1(button_name, button_config):
     next_index = (current_brightness_index + 1) % len(
         DisplayConfig.LCD_BRIGHTNESS_LEVELS
     )
-    DisplayConfig.LCD_BRIGHTNESS = DisplayConfig.LCD_BRIGHTNESS_LEVELS[next_index]
+    DisplayConfig.update_brightness(DisplayConfig.LCD_BRIGHTNESS_LEVELS[next_index])
+    logger.info("LCD brightness changed to: %d", DisplayConfig.LCD_BRIGHTNESS)
 
 
 def handle_key_2(button_name, button_config):
@@ -414,12 +435,23 @@ def handle_key_2(button_name, button_config):
 
 
 def handle_key_3(button_name, button_config):
-    current_power_status = HeatingController.get_instance().get_power_status()
-    if current_power_status == "off":
-        HeatingController.get_instance().turn_on()
+    current_heating_mode = HeatingController.get_instance().get_current_heating_mode()
+    if current_heating_mode.NAME == "free":
+        # In free mode, toggle power
+        current_power_status = HeatingController.get_instance().get_power_status()
+        if current_power_status == "off":
+            HeatingController.get_instance().turn_on()
+        else:
+            HeatingController.get_instance().turn_off()
+        logger.info(
+            "relay status: %s", HeatingController.get_instance().get_power_status()
+        )
     else:
-        HeatingController.get_instance().turn_off()
-    logger.info("relay status: %s", HeatingController.get_instance().get_power_status())
+        # In other modes, toggle MQTT push state
+        CONFIG.mqtt.should_push = not CONFIG.mqtt.should_push
+        logger.info(
+            "MQTT push state: %s", "enabled" if CONFIG.mqtt.should_push else "disabled"
+        )
 
 
 # 240x240 display with hardware SPI:
@@ -592,6 +624,7 @@ try:
                     current_heating_mode.upper_limit,
                 )
 
+        # Draw temperature and mode
         canvas.draw_text_block(
             text=f"{current_heating_mode}",
             pos=(0, 115),
@@ -599,6 +632,19 @@ try:
             font_name=font1[0],
             font_size=font1[1],
             text_color="RED",
+        )
+
+        # Draw MQTT status in top right
+        mqtt_status = "PUSH" if CONFIG.mqtt.should_push else "DROP"
+        mqtt_color = "GREEN" if CONFIG.mqtt.should_push else "RED"
+        canvas.draw_text_block(
+            text=mqtt_status,
+            pos=(disp.width - 60, 0),  # Right side of screen
+            size=(50, 20),
+            font_name=font0[0],
+            font_size=font0[1],
+            text_color=mqtt_color,
+            bg_color="WHITE",
         )
 
         if latest_measurement.raw_celsius is not None:
@@ -624,8 +670,11 @@ try:
         # 4. Render to screen
         canvas.render_to_display(disp)
 
-        # this seems to freeze the device at some point!
-        # disp.bl_DutyCycle(DisplayConfig.LCD_BRIGHTNESS)
+        if DisplayConfig.brightness_changed():
+            # aggressive brightness update seems to freeze the device at some point!
+            disp.bl_DutyCycle(DisplayConfig.LCD_BRIGHTNESS)
+            logger.debug("Updated LCD brightness to: %d", DisplayConfig.LCD_BRIGHTNESS)
+
         time.sleep(0.5)  # Small sleep for CPU relief (adjust frame rate)
 
 except KeyboardInterrupt as e:
