@@ -131,7 +131,7 @@ class Canvas:
             self.default_font_key = self.load_font(default_font_path, default_font_size)
         except Exception as e:
             raise RuntimeError(
-                f"Failed to load default font {default_font_name} size {default_font_size}: {e}"
+                f"Failed to load default font {default_font_path} size {default_font_size}: {e}"
             )
 
     def load_font(self, font_path: str, font_size: float) -> Tuple[str, float]:
@@ -178,13 +178,12 @@ class Canvas:
         """Clear the entire canvas."""
         self.draw.rectangle([(0, 0), self.image.size], fill=bg_color)
 
-    def render(self, disp, rotate_angle=0, brightness=None):
+    def render_to_display(self, disp: ST7789.ST7789, rotate_angle=0, brightness=None):
         """Send the current canvas to the display."""
         rotated_image = self.image.rotate(rotate_angle)
         if brightness is not None:
             disp.bl_DutyCycle(brightness)
-        else:
-            disp.bl_DutyCycle(GlobalConfig.LCD_BRIGHTNESS)
+        logger.info(f"rendering image; pin value: {disp.GPIO_BL_PIN.value}")
         disp.ShowImage(rotated_image)
 
     def draw_button(
@@ -329,14 +328,6 @@ class HeatingController:
         GPIO.setup(HEAT_PLATE_RELAY_GPIO, GPIO.OUT)
 
 
-# 240x240 display with hardware SPI:
-disp = ST7789.ST7789()
-disp.Init()
-
-# Clear display.
-disp.clear()
-
-
 def handle_key_1(button_name, button_config):
     current_brightness_index = GlobalConfig.LCD_BRIGHTNESS_LEVELS.index(
         GlobalConfig.LCD_BRIGHTNESS
@@ -369,6 +360,15 @@ def handle_key_3(button_name, button_config):
     else:
         HeatingController.get_instance().turn_off()
     logger.info("relay status: %s", HeatingController.get_instance().get_power_status())
+
+
+# 240x240 display with hardware SPI:
+disp = ST7789.ST7789()
+disp.Init()
+
+# Clear display.
+disp.clear()
+disp.bl_DutyCycle(GlobalConfig.LCD_BRIGHTNESS)
 
 
 BUTTON_CONFIG = {
@@ -418,7 +418,7 @@ BUTTON_CONFIG = {
 }
 
 
-def poll_buttons(disp):
+def poll_buttons(disp: ST7789.ST7789):
     states = {}
     for name, cfg in BUTTON_CONFIG.items():
         pressed = (
@@ -429,8 +429,8 @@ def poll_buttons(disp):
 
 
 canvas = Canvas(disp.width, disp.height)
-# Load extra fonts if needed
 
+# Load extra fonts if needed
 font0 = canvas.load_font("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 36)
 font1 = canvas.load_font("/usr/share/fonts/truetype/freefont/FreeSerifItalic.ttf", 28)
 
@@ -560,7 +560,7 @@ try:
             )
 
         # 4. Render to screen
-        canvas.render(disp, 0)
+        canvas.render_to_display(disp)
 
         # this seems to freeze the device at some point!
         # disp.bl_DutyCycle(GlobalConfig.LCD_BRIGHTNESS)
